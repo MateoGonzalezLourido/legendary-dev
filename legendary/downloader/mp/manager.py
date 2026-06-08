@@ -47,6 +47,7 @@ class DLManager(Process):
         self.logging_queue = None
         self.dl_worker_queue = None
         self.writer_queue = None
+        self.writer_queue_2 = None  # second parallel file writer
         self.dl_result_q = None
         self.writer_result_q = None
         self.signed_chunks_q: Optional[MPQueue[tuple[ChunkInfo | TerminateWorkerTask, Optional[str]]]] = None
@@ -131,16 +132,17 @@ class DLManager(Process):
                 mismatch = 0
                 completed_files = set()
 
-                for line in open(self.resume_file, encoding='utf-8').readlines():
-                    file_hash, _, filename = line.strip().partition(':')
-                    _p = os.path.join(self.dl_dir, filename)
-                    if not os.path.exists(_p):
-                        self.log.debug(f'File does not exist but is in resume file: "{_p}"')
-                        missing += 1
-                    elif file_hash != manifest.file_manifest_list.get_file_by_path(filename).sha_hash.hex():
-                        mismatch += 1
-                    else:
-                        completed_files.add(filename)
+                with open(self.resume_file, encoding='utf-8') as resume_f:
+                    for line in resume_f:
+                        file_hash, _, filename = line.strip().partition(':')
+                        _p = os.path.join(self.dl_dir, filename)
+                        if not os.path.exists(_p):
+                            self.log.debug(f'File does not exist but is in resume file: "{_p}"')
+                            missing += 1
+                        elif file_hash != manifest.file_manifest_list.get_file_by_path(filename).sha_hash.hex():
+                            mismatch += 1
+                        else:
+                            completed_files.add(filename)
 
                 if missing:
                     self.log.warning(f'{missing} previously completed file(s) are missing, they will be redownloaded.')
@@ -279,7 +281,7 @@ class DLManager(Process):
             # ignore files with less than N chunk parts, this speeds things up dramatically
             cp_threshold = 5
 
-            remaining_files = {fm.filename: {cp.guid_num for cp in fm.chunk_parts}
+            remaining_files = {fm.filename: (fm, {cp.guid_num for cp in fm.chunk_parts})
                                for fm in fmlist if fm.filename not in mc.unchanged}
             _fmlist = []
 
@@ -289,12 +291,12 @@ class DLManager(Process):
                     continue
 
                 _fmlist.append(fm)
-                f_chunks = remaining_files.pop(fm.filename)
+                _, f_chunks = remaining_files.pop(fm.filename)
                 if len(f_chunks) < cp_threshold:
                     continue
 
                 best_overlap, match = 0, None
-                for fname, chunks in remaining_files.items():
+                for fname, (_, chunks) in remaining_files.items():
                     if len(chunks) < cp_threshold:
                         continue
                     overlap = len(f_chunks & chunks)
@@ -302,8 +304,8 @@ class DLManager(Process):
                         best_overlap, match = overlap, fname
 
                 if match:
-                    _fmlist.append(manifest.file_manifest_list.get_file_by_path(match))
-                    remaining_files.pop(match)
+                    matched_fm, _ = remaining_files.pop(match)
+                    _fmlist.append(matched_fm)
 
             fmlist = _fmlist
             opt_delta = time.time() - s_time
@@ -421,14 +423,16 @@ class DLManager(Process):
             if reused:
                 self.log.debug(f' + Reusing {reused} chunks from: {current_file.filename}')
                 # open temporary file that will contain download + old file contents
-                self.tasks.append(FileTask(current_file.filename + u'.tmp', flags=TaskFlags.OPEN_FILE))
+                self.tasks.append(FileTask(current_file.filename + u'.tmp', flags=TaskFlags.OPEN_FILE,
+                                           file_size=current_file.file_size))
                 self.tasks.extend(chunk_tasks)
                 self.tasks.append(FileTask(current_file.filename + u'.tmp', flags=TaskFlags.CLOSE_FILE))
                 # delete old file and rename temporary
                 self.tasks.append(FileTask(current_file.filename, old_file=current_file.filename + u'.tmp',
                                            flags=TaskFlags.RENAME_FILE | TaskFlags.DELETE_FILE))
             else:
-                self.tasks.append(FileTask(current_file.filename, flags=TaskFlags.OPEN_FILE))
+                self.tasks.append(FileTask(current_file.filename, flags=TaskFlags.OPEN_FILE,
+                                           file_size=current_file.file_size))
                 self.tasks.extend(chunk_tasks)
                 self.tasks.append(FileTask(current_file.filename, flags=TaskFlags.CLOSE_FILE))
 
@@ -459,11 +463,11 @@ class DLManager(Process):
             raise MemoryError(f'Current shared memory cache is smaller than required: {shared_mib} < {required_mib}. '
                               + message)
 
-        # calculate actual dl and patch write size.
-        analysis_res.dl_size = \
-            sum(c.file_size for c in manifest.chunk_data_list.elements if c.guid_num in chunks_in_dl_list)
-        analysis_res.uncompressed_dl_size = \
-            sum(c.window_size for c in manifest.chunk_data_list.elements if c.guid_num in chunks_in_dl_list)
+        # calculate actual dl and patch write size in a single pass
+        for c in manifest.chunk_data_list.elements:
+            if c.guid_num in chunks_in_dl_list:
+                analysis_res.dl_size += c.file_size
+                analysis_res.uncompressed_dl_size += c.window_size
 
         # add jobs to remove files
         for fname in mc.removed:
@@ -484,17 +488,26 @@ class DLManager(Process):
         # If we're not using signed URLs, just pretend the raw chunks are the signed ones
         for guid in self.chunks_to_dl:
             self.signed_chunks_q.put((self.chunk_data_list.get_chunk_by_guid(guid), None))
+        # Wake up download_job_manager — it may be waiting on sig_chunks_cond
+        with sig_chunks_cond:
+            sig_chunks_cond.notify_all()
 
 
     def _do_chunk_signing(self, sig_chunks_cond: Condition):
         ticket = self._gen_ticket()
+        # Keep signed_chunks_q filled ahead of workers: fetch when it drops below this threshold
+        prefetch_threshold = self.max_workers * 4
         while self.chunks_to_dl and self.running:
-            if not self.signed_chunks_q.empty():
-                sleep(1)
+            try:
+                pending = self.signed_chunks_q.qsize()
+            except NotImplementedError:
+                pending = 0 if self.signed_chunks_q.empty() else prefetch_threshold
+            if pending >= prefetch_threshold:
+                sleep(0.05)
                 continue
 
             self.log.debug('Fetching more chunk URLs...')
-            num_of_chunks_to_fetch = min(len(self.chunks_to_dl), 50)
+            num_of_chunks_to_fetch = min(len(self.chunks_to_dl), 100)
             unprocessed_chunk_ids = list(self.chunks_to_dl.popleft() for _ in range(num_of_chunks_to_fetch))
             unprocessed_chunks = list(self.chunk_data_list.get_chunk_by_guid(guid) for guid in unprocessed_chunk_ids)
 
@@ -506,10 +519,11 @@ class DLManager(Process):
 
             signed_urls: dict[str, str] = self.sign_pipe.recv()
             for chunk in unprocessed_chunks:
-                signed_url = signed_urls[chunk.path]
-                self.signed_chunks_q.put((chunk, signed_url))
-                with sig_chunks_cond:
-                    sig_chunks_cond.notify()
+                self.signed_chunks_q.put((chunk, signed_urls[chunk.path]))
+            # One notification per batch is enough — download_job_manager wakes
+            # once and then drains whatever is in the queue without re-waiting.
+            with sig_chunks_cond:
+                sig_chunks_cond.notify()
 
     def _gen_ticket(self) -> DownloadTicket:
         # TODO: Verify this works on all games
@@ -525,7 +539,14 @@ class DLManager(Process):
         while self.running and not terminate:
             no_shm = False
             no_signed_chunks = False
-            while self.active_tasks < self.max_workers * 2:
+
+            # Throttle based on available SHM only: high avail_shm → disk keeping
+            # up → allow more downloads; low avail_shm → disk is the bottleneck.
+            # CPU-load throttling was removed: getloadavg() counts our own worker
+            # processes as load, causing the pipeline to throttle itself.
+            avail_shm = len(self.sms)
+            target_inflight = max(self.max_workers, min(self.max_workers * 4, avail_shm // 2))
+            while self.active_tasks < target_inflight:
                 try:
                     sms = self.sms.popleft()
                 except IndexError:  # no free cache
@@ -533,12 +554,14 @@ class DLManager(Process):
                     break
 
                 try:
-                    chunk, url = self.signed_chunks_q.get(False, 3.0)
+                    chunk, url = self.signed_chunks_q.get(block=False)
                 except Empty:
+                    self.sms.appendleft(sms)
                     no_signed_chunks = True
                     break
 
                 if isinstance(chunk, TerminateWorkerTask):
+                    self.sms.appendleft(sms)
                     terminate = True
                     break
 
@@ -546,9 +569,10 @@ class DLManager(Process):
                 try:
                     self.dl_worker_queue.put(DownloaderTask(url=url or (self.base_url + '/' + chunk.path),
                                                             chunk_guid=chunk.guid_num, shm=sms),
-                                             timeout=1.0)
+                                                         timeout=1.0)
                 except Exception as e:
                     self.log.warning(f'Failed to add to download queue: {e!r}')
+                    self.sms.appendleft(sms)
                     self.signed_chunks_q.put((chunk, url))
                     break
 
@@ -568,7 +592,7 @@ class DLManager(Process):
 
             if no_signed_chunks:
                 with sig_chunks_cond:
-                    self.log.debug('Waiting for more signed cunks...')
+                    self.log.debug('Waiting for more signed chunks...')
                     sig_chunks_cond.wait(timeout=1.0)
 
         self.log.debug('Download Job Manager quitting...')
@@ -582,9 +606,9 @@ class DLManager(Process):
         while task and self.running:
             if isinstance(task, FileTask):  # this wasn't necessarily a good idea...
                 try:
-                    self.writer_queue.put(WriterTask(**task.__dict__), timeout=1.0)
                     if task.flags & TaskFlags.OPEN_FILE:
                         current_file = task.filename
+                    self.writer_queue.put(WriterTask(**task.__dict__), timeout=1.0)
                 except Exception as e:
                     self.tasks.appendleft(task)
                     self.log.warning(f'Adding to queue failed: {e!r}')
@@ -653,12 +677,31 @@ class DLManager(Process):
         self.log.debug('Download result handler quitting...')
 
     def fw_results_handler(self, shm_cond: Condition):
+        # Buffer resume-file lines and flush in batches to avoid opening the
+        # file on every completed file (10 000+ times for large games).
+        _resume_buf: list = []
+        _resume_file_handle = None
+        if self.resume_file:
+            try:
+                _resume_file_handle = open(self.resume_file, 'a', encoding='utf-8')
+            except OSError as e:
+                self.log.warning(f'Could not open resume file for writing: {e!r}')
+
+        def _flush_resume():
+            if _resume_file_handle and _resume_buf:
+                _resume_file_handle.writelines(_resume_buf)
+                _resume_file_handle.flush()
+                _resume_buf.clear()
+
         while self.running:
             try:
                 res = self.writer_result_q.get(timeout=1.0)
 
                 if isinstance(res, TerminateWorkerTask):
-                    self.log.debug('Got termination command in FW result handler')
+                    self.log.debug('FW result handler: worker terminated')
+                    _flush_resume()
+                    if _resume_file_handle:
+                        _resume_file_handle.close()
                     break
 
                 self.num_tasks_processed_since_last += 1
@@ -668,9 +711,10 @@ class DLManager(Process):
                         res.filename = res.filename[:-4]
 
                     file_hash = self.hash_map[res.filename]
-                    # write last completed file to super simple resume file
-                    with open(self.resume_file, 'a', encoding='utf-8') as rf:
-                        rf.write(f'{file_hash}:{res.filename}\n')
+                    _resume_buf.append(f'{file_hash}:{res.filename}\n')
+                    # Flush every 20 files or when buffer grows large
+                    if len(_resume_buf) >= 20:
+                        _flush_resume()
 
                 if not res.success:
                     # todo make this kill the installation process or at least skip the file and mark it as failed
@@ -691,6 +735,13 @@ class DLManager(Process):
                 continue
             except Exception as e:
                 self.log.warning(f'Exception when trying to read writer result queue: {e!r}')
+        # Flush and close resume file on any exit path (normal or self.running=False)
+        _flush_resume()
+        if _resume_file_handle:
+            try:
+                _resume_file_handle.close()
+            except OSError:
+                pass
         self.log.debug('Writer result handler quitting...')
 
     def run(self):
@@ -734,11 +785,14 @@ class DLManager(Process):
             queues: list[tuple[str, Optional[MPQueue]]] = [
                 ('Download jobs', self.dl_worker_queue),
                 ('Writer jobs', self.writer_queue),
+                ('Writer jobs 2', self.writer_queue_2),
                 ('Download results', self.dl_result_q),
                 ('Writer results', self.writer_result_q),
                 ('Signed chunks', self.signed_chunks_q)
             ]
             for name, q in queues:
+                if q is None:
+                    continue
                 self.log.debug(f'Cleaning up queue "{name}"')
                 try:
                     while True:
@@ -757,7 +811,44 @@ class DLManager(Process):
             self.shared_memory.unlink()
             self.shared_memory = None
 
+    @staticmethod
+    def _available_ram_bytes() -> int:
+        """Return MemAvailable from /proc/meminfo in bytes. Returns 0 on error or non-Linux."""
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+        return 0
+
     def run_real(self):
+        avail_ram = self._available_ram_bytes()
+
+        # SHM is demand-paged: only active chunks use physical RAM (~64 MB at
+        # max_workers*4 in-flight with 1 MiB chunks).  The virtual allocation
+        # must be large enough to buffer download-write rate mismatches — too
+        # small causes SHM pressure and oscillating download speeds.
+        # Use the caller-supplied value (default 1 GiB) and only reduce it on
+        # RAM-constrained systems (< 8 GiB available).
+        min_shm = max(self.analysis.min_memory,
+                      self.analysis.biggest_chunk * self.max_workers * 2)
+        target = max(self.max_shared_memory, min_shm)
+
+        if avail_ram > 0 and avail_ram < 8 * 1024 ** 3:
+            fraction = 0.20 if avail_ram < 4 * 1024 ** 3 else 0.30
+            ram_cap = max(min_shm, int(avail_ram * fraction))
+            if target > ram_cap:
+                self.log.info(
+                    f'Shared memory reduced: {target // 1024 // 1024} MiB → '
+                    f'{ram_cap // 1024 // 1024} MiB '
+                    f'(RAM available: {avail_ram // 1024 // 1024} MiB)'
+                )
+                target = ram_cap
+
+        self.max_shared_memory = target
+
         self.shared_memory = SharedMemory(create=True, size=self.max_shared_memory)
         self.log.debug(f'Created shared memory of size: {self.shared_memory.size / 1024 / 1024:.02f} MiB')
 
@@ -772,6 +863,7 @@ class DLManager(Process):
         # Create queues
         self.dl_worker_queue = MPQueue(-1)
         self.writer_queue = MPQueue(-1)
+        self.writer_queue_2 = None
         self.dl_result_q = MPQueue(-1)
         self.writer_result_q = MPQueue(-1)
         self.signed_chunks_q = MPQueue(-1)
@@ -789,11 +881,12 @@ class DLManager(Process):
             self.children.append(w)
             w.start()
 
-        self.log.info('Starting file writing worker...')
         writer_p = FileWorker(self.writer_queue, self.writer_result_q, self.dl_dir,
                               self.shared_memory.name, self.cache_dir, self.logging_queue)
         self.children.append(writer_p)
         writer_p.start()
+
+        writer_p2 = None
 
         num_chunk_tasks = sum(isinstance(t, ChunkTask) for t in self.tasks)
         num_dl_tasks = len(self.chunks_to_dl)
@@ -900,8 +993,13 @@ class DLManager(Process):
 
         writer_p.join(timeout=10.0)
         if writer_p.exitcode is None:
-            self.log.warning(f'Terminating writer process, no exit code!')
+            self.log.warning('Terminating writer process 1, no exit code!')
             writer_p.terminate()
+        if writer_p2 is not None:
+            writer_p2.join(timeout=10.0)
+            if writer_p2.exitcode is None:
+                self.log.warning('Terminating writer process 2, no exit code!')
+                writer_p2.terminate()
 
         # forcibly kill DL workers that are not actually dead yet
         for child in self.children:
